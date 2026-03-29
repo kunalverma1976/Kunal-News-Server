@@ -5,129 +5,95 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
+// Rate limit guard: one request at a time, min 60s between calls
+let lastCallTime = 0;
+let inProgress = false;
 
-async function anthropicCall(messages, tools) {
-  const res = await fetch(ANTHROPIC_API, {
+async function callAnthropic(messages) {
+  const body = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    messages,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+  };
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'web-search-2025-03-05'
+      'anthropic-version': '2023-06-01'
     },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4000,
-      tools: tools,
-      messages: messages
-    })
+    body: JSON.stringify(body)
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${err}`);
-  }
   return res.json();
 }
 
-async function runAgentLoop(userPrompt) {
-  const tools = [{
-    type: 'web_search_20250305',
-    name: 'web_search',
-    max_uses: 4
-  }];
+async function runAgentLoop(prompt) {
+  let messages = [{ role: 'user', content: prompt }];
 
-  let messages = [{ role: 'user', content: userPrompt }];
-
-  for (let turn = 0; turn < 10; turn++) {
-    const data = await anthropicCall(messages, tools);
+  for (let i = 0; i < 8; i++) {
+    const data = await callAnthropic(messages);
+    if (!data.content) throw new Error(JSON.stringify(data));
 
     messages.push({ role: 'assistant', content: data.content });
 
     if (data.stop_reason === 'end_turn') {
-      const textBlock = data.content.find(b => b.type === 'text');
-      if (!textBlock) throw new Error('No text in final response');
-      return textBlock.text;
+      return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
     }
 
     if (data.stop_reason === 'tool_use') {
       const toolResults = data.content
         .filter(b => b.type === 'tool_use')
-        .map(b => ({
-          type: 'tool_result',
-          tool_use_id: b.id,
-          content: 'Search completed.'
-        }));
+        .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: 'Search completed.' }));
       if (toolResults.length > 0) {
         messages.push({ role: 'user', content: toolResults });
       }
-      continue;
     }
-
-    const textBlock = data.content.find(b => b.type === 'text');
-    if (textBlock) return textBlock.text;
-    throw new Error(`Unexpected stop_reason: ${data.stop_reason}`);
   }
-
-  throw new Error('Agent loop exceeded maximum turns');
+  throw new Error('Agent loop did not complete in time');
 }
-
-function parseArticles(text) {
-  const clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const start = clean.indexOf('[');
-  const end = clean.lastIndexOf(']');
-  if (start === -1 || end === -1) throw new Error('No JSON array in response');
-  return JSON.parse(clean.slice(start, end + 1));
-}
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
 
 app.post('/fetch-news', async (req, res) => {
-  try {
-    const { topic, isGlobalOnly } = req.body;
-    if (!topic) return res.status(400).json({ error: 'topic required' });
+  // Block if another request is already running
+  if (inProgress) {
+    return res.status(429).json({ error: 'A fetch is already in progress. Please wait.' });
+  }
 
+  // Enforce 60-second gap between calls
+  const now = Date.now();
+  const elapsed = now - lastCallTime;
+  if (lastCallTime > 0 && elapsed < 60000) {
+    const wait = Math.ceil((60000 - elapsed) / 1000);
+    return res.status(429).json({ error: `Rate limit: please wait ${wait} more seconds before fetching again.` });
+  }
+
+  const { topic } = req.body;
+  if (!topic) return res.status(400).json({ error: 'topic required' });
+
+  inProgress = true;
+  lastCallTime = Date.now();
+
+  try {
     const today = new Date().toDateString();
 
-    const jsonSchema = `[{"title":"Headline","summary":"2-3 sentence overview","detail":"5-6 sentences with background, who is involved, significance, reactions, what comes next","source":"Publication","scope":"global","relevance":85}]`;
+    // Single compact prompt — keeps input tokens low
+    const prompt =
+      `Today: ${today}. Search for 10 recent news stories about: "${topic}". ` +
+      `Mix global and India-relevant stories. ` +
+      `Reply ONLY with a valid JSON array, no markdown. ` +
+      `Format: [{"title":"...","summary":"2 sentences max","source":"...","scope":"global or india","relevance":80}]. ` +
+      `Exactly 10 items.`;
 
-    if (isGlobalOnly) {
-      // Single call for 20 global stories
-      const prompt = `Today: ${today}. Search for 20 important recent global news stories about: "${topic}". Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "global". 20 items. JSON only.`;
-      const text = await runAgentLoop(prompt);
-      const articles = parseArticles(text);
-      return res.json({ articles });
-
-    } else {
-      // TWO separate calls — one global, one India — to stay under rate limits
-      const globalPrompt = `Today: ${today}. Search for 10 important recent GLOBAL/INTERNATIONAL news stories about: "${topic}". Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "global". Exactly 10 items. JSON only.`;
-
-      const indiaPrompt = `Today: ${today}. You serve a reader in Lucknow, Uttar Pradesh, India. Search for 10 recent news stories about: "${topic}" that are specifically relevant to India, Uttar Pradesh, or Lucknow — include government policy, local industry, UP/Lucknow-specific developments. Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "india". Exactly 10 items. JSON only.`;
-
-      // Run global call first
-      const globalText = await runAgentLoop(globalPrompt);
-      const globalArticles = parseArticles(globalText);
-
-      // Wait 3 seconds between calls to respect rate limits
-      await new Promise(resolve => setTimeout(resolve, 3000));
-
-      // Run India call second
-      const indiaText = await runAgentLoop(indiaPrompt);
-      const indiaArticles = parseArticles(indiaText);
-
-      // Merge: global first, then india
-      const articles = [...globalArticles, ...indiaArticles];
-      return res.json({ articles });
-    }
+    const text = await runAgentLoop(prompt);
+    res.json({ text });
 
   } catch (err) {
     console.error('fetch-news error:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    inProgress = false;
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
