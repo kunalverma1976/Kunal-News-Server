@@ -5,57 +5,72 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+async function callAnthropic(messages, useSearch) {
+  const body = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4000,
+    messages: messages
+  };
+  if (useSearch) {
+    body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+  }
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+async function runAgentLoop(prompt) {
+  let messages = [{ role: 'user', content: prompt }];
+  
+  for (let i = 0; i < 10; i++) {
+    const data = await callAnthropic(messages, true);
+    
+    if (!data.content) throw new Error('No content in response');
+    
+    // Add assistant response to messages
+    messages.push({ role: 'assistant', content: data.content });
+    
+    // Check if we have a final text response
+    if (data.stop_reason === 'end_turn') {
+      const text = data.content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('');
+      return text;
+    }
+    
+    // If tool_use, add tool results and continue loop
+    if (data.stop_reason === 'tool_use') {
+      const toolResults = data.content
+        .filter(b => b.type === 'tool_use')
+        .map(b => ({
+          type: 'tool_result',
+          tool_use_id: b.id,
+          content: b.type === 'web_search_tool_result' ? b.content : 'Search done.'
+        }));
+      
+      if (toolResults.length > 0) {
+        messages.push({ role: 'user', content: toolResults });
+      }
+    }
+  }
+  throw new Error('Agent loop did not complete');
+}
+
 app.post('/fetch-news', async (req, res) => {
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify(req.body)
-    });
-
-    const data = await response.json();
-
-    // If web search is being used, Anthropic may stop mid-way
-    // and need a follow-up message to get the final text response
-    if (data.stop_reason === 'tool_use') {
-      // Build follow-up conversation with tool results included
-      const followUp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: req.body.model,
-          max_tokens: req.body.max_tokens,
-          tools: req.body.tools,
-          messages: [
-            ...req.body.messages,
-            { role: 'assistant', content: data.content },
-            {
-              role: 'user',
-              content: data.content
-                .filter(b => b.type === 'tool_use')
-                .map(b => ({
-                  type: 'tool_result',
-                  tool_use_id: b.id,
-                  content: 'Search completed. Now compile your findings into the JSON array as instructed.'
-                }))
-            }
-          ]
-        })
-      });
-      const finalData = await followUp.json();
-      return res.json(finalData);
-    }
-
-    res.json(data);
+    const { prompt } = req.body;
+    const text = await runAgentLoop(prompt);
+    res.json({ text });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
