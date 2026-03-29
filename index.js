@@ -17,8 +17,8 @@ async function anthropicCall(messages, tools) {
       'anthropic-beta': 'web-search-2025-03-05'
     },
     body: JSON.stringify({
-      model: 'claude-opus-4-5',
-      max_tokens: 8000,
+      model: 'claude-sonnet-4-6',
+      max_tokens: 6000,
       tools: tools,
       messages: messages
     })
@@ -35,7 +35,7 @@ async function runAgentLoop(userPrompt) {
   const tools = [{
     type: 'web_search_20250305',
     name: 'web_search',
-    max_uses: 10
+    max_uses: 8
   }];
 
   let messages = [{ role: 'user', content: userPrompt }];
@@ -87,50 +87,24 @@ app.post('/fetch-news', async (req, res) => {
     let prompt;
 
     if (isGlobalOnly) {
-      prompt = `Today is ${today}. You are a news researcher for a reader in India.
+      prompt = `Today: ${today}. Find 20 important recent global news stories about: "${topic}".
 
-Search the web thoroughly and find the 20 most important RECENT global news stories about: "${topic}"
+Return ONLY a JSON array, no markdown, no extra text:
+[{"title":"...","summary":"2-3 sentences on what happened and why it matters","detail":"5-6 sentences: what happened, who is involved, background, global significance, reactions, what comes next","source":"Publication name","scope":"global","relevance":85}]
 
-Focus on stories from the last 48 hours where possible. Cover diverse regions and angles.
-
-Return ONLY a JSON array — no markdown fences, no preamble, no explanation. Each object must have exactly these fields:
-
-[
-  {
-    "title": "Specific, informative headline",
-    "summary": "2-3 sentence overview of what happened and why it matters",
-    "detail": "A thorough 6-8 sentence detailed account of the story. Include: what happened, who is involved, the background context, why it matters globally, any reactions or consequences so far, and what might happen next.",
-    "source": "Publication name",
-    "scope": "global",
-    "relevance": 88
-  }
-]
-
-Return only the JSON array. 20 items. No other text.`;
+20 items. JSON only.`;
     } else {
-      prompt = `Today is ${today}. You are a news researcher for a reader based in Lucknow, Uttar Pradesh, India.
+      prompt = `Today: ${today}. You serve a reader in Lucknow, Uttar Pradesh, India.
 
-Search the web thoroughly and find 20 recent news stories about: "${topic}"
+Find 20 recent news stories about: "${topic}"
+- 10 GLOBAL: top international stories on this topic
+- 10 INDIA/LOCAL: stories about India, Uttar Pradesh, or Lucknow on this topic
 
-Split them as follows:
-- 10 GLOBAL stories: the most important international developments on this topic
-- 10 INDIA/LOCAL stories: stories specifically relevant to India, Uttar Pradesh, or Lucknow on this topic. Include state government actions, local industry news, UP-specific developments, and stories that directly affect people in Lucknow.
+Return ONLY a JSON array, no markdown, no extra text:
+[{"title":"...","summary":"2-3 sentences on what happened and why it matters","detail":"5-6 sentences: what happened, who is involved, background, significance, reactions, what comes next","source":"Publication name","scope":"global","relevance":85}]
 
-Return ONLY a JSON array — no markdown fences, no preamble, no explanation. Each object must have exactly these fields:
-
-[
-  {
-    "title": "Specific, informative headline",
-    "summary": "2-3 sentence overview of what happened and why it matters",
-    "detail": "A thorough 6-8 sentence detailed account of the story. Include: what happened, who is involved, the background context, why it matters (globally or locally), any reactions or consequences so far, and what might happen next.",
-    "source": "Publication name",
-    "scope": "global",
-    "relevance": 85
-  }
-]
-
-Use "scope": "global" for the 10 international stories and "scope": "india" for the 10 India/Lucknow stories.
-Return only the JSON array. Exactly 20 items (10 global + 10 india). No other text.`;
+Set "scope":"global" for international stories and "scope":"india" for India/Lucknow stories.
+Exactly 20 items (10 global + 10 india). JSON only.`;
     }
 
     const text = await runAgentLoop(prompt);
