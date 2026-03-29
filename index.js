@@ -18,7 +18,7 @@ async function anthropicCall(messages, tools) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
-      max_tokens: 6000,
+      max_tokens: 4000,
       tools: tools,
       messages: messages
     })
@@ -35,12 +35,12 @@ async function runAgentLoop(userPrompt) {
   const tools = [{
     type: 'web_search_20250305',
     name: 'web_search',
-    max_uses: 8
+    max_uses: 4
   }];
 
   let messages = [{ role: 'user', content: userPrompt }];
 
-  for (let turn = 0; turn < 15; turn++) {
+  for (let turn = 0; turn < 10; turn++) {
     const data = await anthropicCall(messages, tools);
 
     messages.push({ role: 'assistant', content: data.content });
@@ -59,7 +59,6 @@ async function runAgentLoop(userPrompt) {
           tool_use_id: b.id,
           content: 'Search completed.'
         }));
-
       if (toolResults.length > 0) {
         messages.push({ role: 'user', content: toolResults });
       }
@@ -74,6 +73,14 @@ async function runAgentLoop(userPrompt) {
   throw new Error('Agent loop exceeded maximum turns');
 }
 
+function parseArticles(text) {
+  const clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+  const start = clean.indexOf('[');
+  const end = clean.lastIndexOf(']');
+  if (start === -1 || end === -1) throw new Error('No JSON array in response');
+  return JSON.parse(clean.slice(start, end + 1));
+}
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
@@ -84,39 +91,37 @@ app.post('/fetch-news', async (req, res) => {
     if (!topic) return res.status(400).json({ error: 'topic required' });
 
     const today = new Date().toDateString();
-    let prompt;
+
+    const jsonSchema = `[{"title":"Headline","summary":"2-3 sentence overview","detail":"5-6 sentences with background, who is involved, significance, reactions, what comes next","source":"Publication","scope":"global","relevance":85}]`;
 
     if (isGlobalOnly) {
-      prompt = `Today: ${today}. Find 20 important recent global news stories about: "${topic}".
+      // Single call for 20 global stories
+      const prompt = `Today: ${today}. Search for 20 important recent global news stories about: "${topic}". Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "global". 20 items. JSON only.`;
+      const text = await runAgentLoop(prompt);
+      const articles = parseArticles(text);
+      return res.json({ articles });
 
-Return ONLY a JSON array, no markdown, no extra text:
-[{"title":"...","summary":"2-3 sentences on what happened and why it matters","detail":"5-6 sentences: what happened, who is involved, background, global significance, reactions, what comes next","source":"Publication name","scope":"global","relevance":85}]
-
-20 items. JSON only.`;
     } else {
-      prompt = `Today: ${today}. You serve a reader in Lucknow, Uttar Pradesh, India.
+      // TWO separate calls — one global, one India — to stay under rate limits
+      const globalPrompt = `Today: ${today}. Search for 10 important recent GLOBAL/INTERNATIONAL news stories about: "${topic}". Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "global". Exactly 10 items. JSON only.`;
 
-Find 20 recent news stories about: "${topic}"
-- 10 GLOBAL: top international stories on this topic
-- 10 INDIA/LOCAL: stories about India, Uttar Pradesh, or Lucknow on this topic
+      const indiaPrompt = `Today: ${today}. You serve a reader in Lucknow, Uttar Pradesh, India. Search for 10 recent news stories about: "${topic}" that are specifically relevant to India, Uttar Pradesh, or Lucknow — include government policy, local industry, UP/Lucknow-specific developments. Return ONLY a JSON array using this exact structure, no markdown: ${jsonSchema}. Set all scope values to "india". Exactly 10 items. JSON only.`;
 
-Return ONLY a JSON array, no markdown, no extra text:
-[{"title":"...","summary":"2-3 sentences on what happened and why it matters","detail":"5-6 sentences: what happened, who is involved, background, significance, reactions, what comes next","source":"Publication name","scope":"global","relevance":85}]
+      // Run global call first
+      const globalText = await runAgentLoop(globalPrompt);
+      const globalArticles = parseArticles(globalText);
 
-Set "scope":"global" for international stories and "scope":"india" for India/Lucknow stories.
-Exactly 20 items (10 global + 10 india). JSON only.`;
+      // Wait 3 seconds between calls to respect rate limits
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Run India call second
+      const indiaText = await runAgentLoop(indiaPrompt);
+      const indiaArticles = parseArticles(indiaText);
+
+      // Merge: global first, then india
+      const articles = [...globalArticles, ...indiaArticles];
+      return res.json({ articles });
     }
-
-    const text = await runAgentLoop(prompt);
-
-    const clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-    const start = clean.indexOf('[');
-    const end = clean.lastIndexOf(']');
-    if (start === -1 || end === -1) throw new Error('No JSON array in response');
-
-    const articles = JSON.parse(clean.slice(start, end + 1));
-    res.json({ articles });
 
   } catch (err) {
     console.error('fetch-news error:', err.message);
